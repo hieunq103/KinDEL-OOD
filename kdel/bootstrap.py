@@ -1,7 +1,7 @@
 import argparse, os
 import numpy as np, pandas as pd, torch
 from scipy.stats import rankdata
-from kdel.hier import HierDEL
+from kdel.hier import HierDEL, LMTable
 from kdel.evaluate import load_heldout, score
 
 # Spearman tot nhat cua bai bao KinDEL (disynthon, in-library) - de doi chieu
@@ -27,18 +27,20 @@ def main():
     ap.add_argument("--ckpts", nargs="+", required=True)
     ap.add_argument("--device", default="cpu"); ap.add_argument("--B", type=int, default=5000)
     ap.add_argument("--out", default="bootstrap.csv"); ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--lm_dir", default=None)
     a = ap.parse_args()
-    models = []
+    models, lms = [], []
     for d in a.ckpts:
         cfg = torch.load(f"{d}/last.pt", map_location="cpu")["cfg"]
         m = HierDEL(**cfg["model"]).to(a.device)
         m.load_state_dict(torch.load(f"{d}/best.pt", map_location=a.device)); models.append(m)
+        lms.append(LMTable(a.lm_dir, a.device) if cfg["model"].get("use_lm") else None)
     rng = np.random.default_rng(a.seed); rows = []
     for cond in ("on", "off"):
         full = load_heldout(a.root, a.target, cond)
         has = full["molecule_hash"].notna() & full[["smiles_a", "smiles_b", "smiles_c"]].notna().all(1)
         df = full[has].reset_index(drop=True); n = len(df); kd = df["kd"].to_numpy()
-        S = [score(m, df, a.device) for m in models]               # moi phan tu: dict rule -> [n]
+        S = [score(m, df, a.device, lm=l) for m, l in zip(models, lms)]               # moi phan tu: dict rule -> [n]
         idx = rng.integers(0, n, size=(a.B, n))                    # CUNG mot bo resample cho moi cach cham/ckpt
         for rule in S[0]:
             per = np.stack([s[rule] for s in S])                    # [K,n]

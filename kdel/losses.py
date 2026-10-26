@@ -21,3 +21,12 @@ def total_loss(out, b, beta=1.0, zero_inflated=True):
     l_t = nb_nll(b.target_counts,  ll_t, d_t, b.pre, pi_t).mean()
     l_c = nb_nll(b.control_counts, ll_c, d_c, b.pre, pi_c).mean()
     return l_t + beta*l_c, {"target": l_t.item(), "control": l_c.item()}
+
+
+def rank_loss(score, y, w, margin=0.5):
+    """Ranking logistic co trong so tin cay: voi moi cap (i,j) co y_i - y_j > margin, phat -log sigmoid(s_i - s_j).
+    score,y,w: [B]. w_ij = w_i * w_j."""
+    dy = y.unsqueeze(1) - y.unsqueeze(0)
+    pair = (dy > margin).float() * (w.unsqueeze(1) * w.unsqueeze(0))
+    l = F.softplus(-(score.unsqueeze(1) - score.unsqueeze(0)))
+    return (pair * l).sum() / pair.sum().clamp_min(1e-6)

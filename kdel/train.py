@@ -1,9 +1,10 @@
 import argparse, os, time, math, json, yaml
 import numpy as np, pandas as pd, torch
+import torch.nn.functional as F
 from scipy.stats import spearmanr
 from kdel.gpu_data import GPUGraphStore
-from kdel.hier import HierDEL, SynStore
-from kdel.losses import nb_nll, total_loss
+from kdel.hier import HierDEL, SynStore, LMTable
+from kdel.losses import nb_nll, total_loss, rank_loss
 
 
 def atomic_save(obj, path):
@@ -49,6 +50,7 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--max_steps", type=int, default=0)   # >0: chay thu
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--lm_dir", default=None)   # thu muc co synthon_chemberta.npz (bat buoc neu model.use_lm)
     a = ap.parse_args()
 
     cfg = yaml.safe_load(open(a.config)); M, T = cfg["model"], cfg["train"]
@@ -59,7 +61,14 @@ def main():
     store = GPUGraphStore(a.root, dev)
     voc = pd.read_parquet(f"{a.root}/synthon_vocab.parquet").sort_values("id")
     assert (voc["id"].to_numpy() == np.arange(len(voc))).all()
-    syn = SynStore(voc["smiles"].tolist(), dev)
+    lm = LMTable(a.lm_dir, dev) if M.get("use_lm") else None
+    if M.get("use_lm"): M["lm_dim"] = lm.dim
+    syn = SynStore(voc["smiles"].tolist(), dev, lm=lm)
+    # loss phu doan ID synthon: kich thuoc theo tung vi tri A/B/C (id co offset theo vi tri)
+    g = voc.groupby("pos")["id"].agg(["min", "count"]).loc[["A", "B", "C"]]
+    offs = torch.tensor(g["min"].to_numpy(), device=dev); sizes = g["count"].tolist()
+    lam_rank, lam_aux = float(T.get("lambda_rank", 0.0)), float(T.get("lambda_aux", 0.0))
+    if lam_aux > 0: M["aux_sizes"] = sizes
     synidx = torch.from_numpy(np.load(f"{a.root}/synthon_idx.npy").astype(np.int64)).to(dev)
     S = np.load(f"{a.root}/splits_disynthon.npy")[:, a.split - 1]
     tr = torch.from_numpy(np.where(S == 0)[0]); va = torch.from_numpy(np.where(S == 1)[0])
@@ -87,7 +96,7 @@ def main():
                          scaler=scaler.state_dict(), st=st, cfg=cfg), last)
 
     logf = open(f"{a.out}/log.jsonl", "a")
-    model.train(); t0 = time.time(); seen = 0; run = [0.0, 0.0, 0]
+    model.train(); t0 = time.time(); seen = 0; run = [0.0, 0.0, 0, 0.0, 0.0]
     stop = False
     while st["epoch"] < T["epochs"] and not stop:
         g = torch.Generator().manual_seed(a.seed * 1000 + st["epoch"])
@@ -102,8 +111,19 @@ def main():
                 out = model(b, syn)
             out = {k: v.float() for k, v in out.items()}
             loss, parts = total_loss(out, b, beta=T["beta"], zero_inflated=zi)
+            if lam_rank > 0:
+                S_ = b.target_counts.sum(1).float()
+                y_ = torch.log((b.target_counts.float().mean(1) + 0.5) / b.pre)
+                w_ = b.weight * (S_ / (S_ + 3.0))                  # phan tu it read -> trong so ~0
+                lr_ = rank_loss(out["log_lambda"][:, 0], y_, w_, T.get("rank_margin", 0.5))
+                loss = loss + lam_rank * lr_; parts["rank"] = lr_.item()
+            if lam_aux > 0:
+                lg = out["aux"].split(sizes, dim=1)
+                la_ = sum(F.cross_entropy(lg[k], b.syn[:, k] - offs[k]) for k in range(3)) / 3
+                loss = loss + lam_aux * la_; parts["aux"] = la_.item()
             scaler.scale(loss / acc).backward()
             st["mb"] += 1; seen += bs; run[0] += parts["target"]; run[1] += parts["control"]; run[2] += 1
+            run[3] += parts.get("rank", 0.0); run[4] += parts.get("aux", 0.0)
             if st["mb"] % acc == 0:
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -111,11 +131,11 @@ def main():
                 st["step"] += 1
                 if st["step"] % 100 == 0:
                     dt = time.time() - t0
-                    rec = dict(step=st["step"], epoch=st["epoch"], nll_t=run[0] / run[2], nll_c=run[1] / run[2],
+                    rec = dict(step=st["step"], epoch=st["epoch"], nll_t=run[0] / run[2], nll_c=run[1] / run[2], rank=run[3] / run[2], aux=run[4] / run[2],
                                lr=opt.param_groups[0]["lr"], mol_s=seen / dt,
                                vram=torch.cuda.max_memory_allocated() / 1e9 if dev == "cuda" else 0)
                     print(json.dumps(rec), flush=True); logf.write(json.dumps(rec) + "\n"); logf.flush()
-                    run = [0.0, 0.0, 0]; t0 = time.time(); seen = 0
+                    run = [0.0, 0.0, 0, 0.0, 0.0]; t0 = time.time(); seen = 0
                 if st["step"] % T["save_every"] == 0: save()
                 if a.max_steps and st["step"] >= a.max_steps: stop = True; break
                 if (time.time() - t_start) / 3600 > T["wall_limit_hours"]:

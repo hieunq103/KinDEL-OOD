@@ -1,4 +1,4 @@
-import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
+import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
 from torch_geometric.nn import GINEConv, global_add_pool
 from kdel.gpu_data import _ranges
 from kdel.featurize import smiles_to_arrays
@@ -15,12 +15,31 @@ def clean_syn(s):
     return ".".join(p.strip() for p in str(s).split(","))
 
 
+class LMTable:
+    """Bang embedding ChemBERTa theo CHUOI SYNTHON THO (da chuan hoa tung chieu; BLANK = 0)."""
+    def __init__(self, lm_dir, device="cuda"):
+        d = np.load(f"{lm_dir}/synthon_chemberta.npz")
+        Z = (d["emb"].astype(np.float32) - d["mean"]) / d["std"]
+        Z[d["blank"]] = 0.0
+        sm = pd.read_parquet(f"{lm_dir}/synthon_chemberta_smiles.parquet")["smiles"].tolist()
+        self.idx = {s: i for i, s in enumerate(sm)}
+        self.Z = torch.from_numpy(Z).to(device); self.dim = Z.shape[1]; self.dev = device
+
+    def lookup(self, smiles):
+        rows = [self.idx.get(s, -1) for s in smiles]
+        miss = sum(r < 0 for r in rows)
+        if miss: print(f"[LMTable] canh bao: {miss}/{len(rows)} synthon khong co embedding -> vector 0", flush=True)
+        out = self.Z[torch.tensor([max(r, 0) for r in rows], device=self.dev)].clone()
+        out[torch.tensor([r < 0 for r in rows], device=self.dev)] = 0.0
+        return out
+
+
 class SynStore:
-    """Do thi cua toan bo synthon (~1.7k) nam tren GPU; lay theo id."""
-    def __init__(self, smiles, device="cuda"):
+    """Do thi cua cac synthon nam tren GPU; lay theo id. lm: LMTable (tuy chon)."""
+    def __init__(self, smiles, device="cuda", lm=None):
         arrs = [smiles_to_arrays(clean_syn(s)) for s in smiles]
         nn_ = np.array([a[0].shape[0] for a in arrs]); ee = np.array([a[1].shape[1] for a in arrs])
-        T = lambda a, dt=None: torch.from_numpy(a).to(device)
+        T = lambda a: torch.from_numpy(a).to(device)
         self.x    = T(np.concatenate([a[0] for a in arrs], 0))
         self.ei   = T(np.concatenate([a[1] for a in arrs], 1))
         self.ea   = T(np.concatenate([a[2] for a in arrs], 0))
@@ -28,6 +47,7 @@ class SynStore:
         self.eptr = T(np.r_[0, np.cumsum(ee)].astype(np.int64))
         self.dev  = device
         self.n = len(smiles)
+        self.lm = lm.lookup(list(smiles)) if lm is not None else None     # [n, lm_dim]
 
     def batch(self, ids):
         ids = ids.long()
@@ -61,14 +81,22 @@ class GINEEncoder(nn.Module):
 
 
 class HierDEL(nn.Module):
-    """7 token phan cap: A,B,C (GNN tren synthon) ; AB,AC,BC (MLP ghep cap) ; ABC (GNN tren phan tu day du)
-       -> 1 lop self-attention -> attention pooling -> dau NB."""
+    """7 token phan cap: A,B,C (GNN tren synthon [+ ChemBERTa]) ; AB,AC,BC (MLP ghep cap) ; ABC (GNN tren phan tu day du)
+       -> 1 lop self-attention -> attention pooling -> dau NB.
+       use_lm: cong embedding ChemBERTa (da chieu) vao token synthon.
+       fusion: 'add' = khong cong ; 'gate' = tanh(alpha) * proj(emb)  (kieu MolProphecy, alpha la so vo huong hoc duoc).
+       aux_sizes: (nA,nB,nC) -> them dau doan ID synthon tu vector tong hop z."""
     def __init__(self, node_dim=28, edge_dim=6, hidden=256, n_layers=5, syn_layers=3,
-                 dropout=0.2, heads=4):
+                 dropout=0.2, heads=4, use_lm=False, lm_dim=384, fusion="add", aux_sizes=None):
         super().__init__()
         H = hidden
+        self.use_lm, self.fusion = use_lm, fusion
         self.syn_enc  = GINEEncoder(node_dim, edge_dim, H, syn_layers, dropout)
         self.full_enc = GINEEncoder(node_dim, edge_dim, H, n_layers, dropout)
+        if use_lm:
+            self.lm_proj = nn.Sequential(nn.Dropout(dropout), nn.Linear(lm_dim, H))
+            if fusion == "gate":
+                self.lm_gate = nn.Parameter(torch.zeros(1))
         self.pos  = nn.Embedding(3, H)
         self.pair = nn.ModuleList([mlp(2 * H, H, H) for _ in range(3)])   # AB, AC, BC
         self.tri  = nn.Linear(H, H)
@@ -80,11 +108,17 @@ class HierDEL(nn.Module):
         self.score = mlp(H, H, 2)       # log lambda: target, control
         self.zero  = mlp(H, H, 2)       # logit pi (chi dung khi zero_inflated)
         self.log_disp = nn.Parameter(torch.zeros(2))
+        self.aux = nn.Linear(H, int(sum(aux_sizes))) if aux_sizes else None
 
     def forward(self, d, syn_store):
         B = d.syn.shape[0]
         u, inv = torch.unique(d.syn, return_inverse=True)            # inv: [B,3]
         zs = self.syn_enc(*syn_store.batch(u), n=len(u))             # [U,H]
+        if self.use_lm:
+            e = self.lm_proj(syn_store.lm[u])
+            if self.fusion == "gate":
+                e = torch.tanh(self.lm_gate) * e
+            zs = zs + e
         zA, zB, zC = [zs[inv[:, k]] + self.pos.weight[k] for k in range(3)]
         zf = self.full_enc(d.x, d.edge_index, d.edge_attr, d.batch, n=B)
         tok = torch.stack([zA, zB, zC,
@@ -95,5 +129,8 @@ class HierDEL(nn.Module):
         tok = self.tf(tok)
         z, _ = self.attn(self.q.expand(B, -1, -1), tok, tok, need_weights=False)
         z = self.norm(z.squeeze(1))
-        return {"log_lambda": self.score(z), "pi_logit": self.zero(z),
-                "log_disp": self.log_disp, "z": z}
+        out = {"log_lambda": self.score(z), "pi_logit": self.zero(z),
+               "log_disp": self.log_disp, "z": z}
+        if self.aux is not None:
+            out["aux"] = self.aux(z)
+        return out

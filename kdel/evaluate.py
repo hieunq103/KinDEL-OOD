@@ -2,7 +2,7 @@ import argparse, os, json
 import numpy as np, pandas as pd, torch
 from scipy.stats import spearmanr
 from kdel.featurize import smiles_to_arrays
-from kdel.hier import HierDEL, SynStore
+from kdel.hier import HierDEL, SynStore, LMTable
 
 
 class _B: pass
@@ -24,13 +24,13 @@ def to_batch(smiles, syn_ids, dev):
 
 
 @torch.no_grad()
-def score(model, df, dev, bs=64):
+def score(model, df, dev, bs=64, lm=None):
     """-> dict ten_score -> np.array. Synthon duoc featurize truc tiep tu SMILES (khong can nam trong vocab)."""
     cols = ["smiles_a", "smiles_b", "smiles_c"]
     uniq = pd.unique(df[cols].to_numpy().ravel()).tolist()
     mp = {s: i for i, s in enumerate(uniq)}
     ids = np.stack([df[c].map(mp).to_numpy() for c in cols], 1)
-    syn = SynStore(uniq, dev)
+    syn = SynStore(uniq, dev, lm=lm)
     smi = df["smiles"].tolist(); s_t, s_d = [], []
     model.eval()
     for i in range(0, len(df), bs):
@@ -49,7 +49,7 @@ def load_heldout(root, target, cond):
     return df.dropna(subset=["kd"])
 
 
-def eval_ckpt(model, root, target, dev):
+def eval_ckpt(model, root, target, dev, lm=None):
     rows = []
     for cond in ("on", "off"):
         full = load_heldout(root, target, cond)
@@ -60,7 +60,7 @@ def eval_ckpt(model, root, target, dev):
             if df is None or len(df) < 5:
                 rows.append(dict(cond=cond, lib=lib, n=int((~has).sum() + has.sum()) if df is None else len(df),
                                  score="n/a (phan tu ngoai DEL khong co synthon)", rho=np.nan)); continue
-            for name, sc in score(model, df.reset_index(drop=True), dev).items():
+            for name, sc in score(model, df.reset_index(drop=True), dev, lm=lm).items():
                 rho = spearmanr(sc, df["kd"].to_numpy()).statistic
                 rows.append(dict(cond=cond, lib=lib, n=len(df), score=name, rho=-rho))   # -rho: dau theo bai bao
     return pd.DataFrame(rows)
@@ -71,13 +71,15 @@ def main():
     ap.add_argument("--root", required=True); ap.add_argument("--target", required=True)
     ap.add_argument("--ckpts", nargs="+", required=True)      # thu muc chua best.pt + last.pt
     ap.add_argument("--device", default="cuda"); ap.add_argument("--out", default="eval.csv")
+    ap.add_argument("--lm_dir", default=None)
     a = ap.parse_args()
     allr = []
     for k, d in enumerate(a.ckpts):
         cfg = torch.load(f"{d}/last.pt", map_location="cpu")["cfg"]
         m = HierDEL(**cfg["model"]).to(a.device)
         m.load_state_dict(torch.load(f"{d}/best.pt", map_location=a.device))
-        r = eval_ckpt(m, a.root, a.target, a.device); r["ckpt"] = os.path.basename(d.rstrip("/"))
+        lm = LMTable(a.lm_dir, a.device) if cfg["model"].get("use_lm") else None
+        r = eval_ckpt(m, a.root, a.target, a.device, lm=lm); r["ckpt"] = os.path.basename(d.rstrip("/"))
         allr.append(r)
     R = pd.concat(allr); R.to_csv(a.out, index=False)
     print(R.to_string(index=False))
