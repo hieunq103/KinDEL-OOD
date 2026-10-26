@@ -1,0 +1,7 @@
+.venv/
+data/
+*.npy
+*.pt
+*.parquet
+__pycache__/
+.DS_Store
