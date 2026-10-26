@@ -8,10 +8,17 @@ def mlp(i, h, o):
     return nn.Sequential(nn.Linear(i, h), nn.ReLU(), nn.Linear(h, o))
 
 
+def clean_syn(s):
+    """Muc 'X, Y' = 2 thanh phan -> 'X.Y' (1 do thi 2 manh); 'BLANK'/rong -> '' (nut rong)."""
+    if s is None or str(s).strip().upper() in ("BLANK", "NAN", ""):
+        return ""
+    return ".".join(p.strip() for p in str(s).split(","))
+
+
 class SynStore:
     """Do thi cua toan bo synthon (~1.7k) nam tren GPU; lay theo id."""
     def __init__(self, smiles, device="cuda"):
-        arrs = [smiles_to_arrays(s) for s in smiles]
+        arrs = [smiles_to_arrays(clean_syn(s)) for s in smiles]
         nn_ = np.array([a[0].shape[0] for a in arrs]); ee = np.array([a[1].shape[1] for a in arrs])
         T = lambda a, dt=None: torch.from_numpy(a).to(device)
         self.x    = T(np.concatenate([a[0] for a in arrs], 0))
