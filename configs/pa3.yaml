@@ -1,0 +1,23 @@
+name: pa3_synthon_dropout
+model:
+  node_dim: 28
+  edge_dim: 6
+  hidden: 256
+  n_layers: 5
+  syn_layers: 3
+  heads: 4
+  dropout: 0.2
+train:
+  batch_size: 256
+  accum: 4
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  warmup_steps: 300
+  epochs: 20
+  beta: 1.0
+  zero_inflated: false
+  patience: 4
+  save_every: 500
+  val_size: 100000
+  wall_limit_hours: 11.0
+  syn_drop: 0.3

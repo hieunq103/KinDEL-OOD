@@ -68,6 +68,7 @@ def main():
     g = voc.groupby("pos")["id"].agg(["min", "count"]).loc[["A", "B", "C"]]
     offs = torch.tensor(g["min"].to_numpy(), device=dev); sizes = g["count"].tolist()
     lam_rank, lam_aux = float(T.get("lambda_rank", 0.0)), float(T.get("lambda_aux", 0.0))
+    p_sdrop = float(T.get("syn_drop", 0.0))      # xac suat xoa token synthon (PA3)
     if lam_aux > 0: M["aux_sizes"] = sizes
     synidx = torch.from_numpy(np.load(f"{a.root}/synthon_idx.npy").astype(np.int64)).to(dev)
     S = np.load(f"{a.root}/splits_disynthon.npy")[:, a.split - 1]
@@ -107,8 +108,9 @@ def main():
                 for gr in opt.param_groups: gr["lr"] = lr_at(st["step"], total, T["lr"], T["warmup_steps"])
             i = st["mb"] * bs
             b = store.batch(perm[i:i + bs]); b.syn = synidx[b.idx]
+            ds = (torch.rand(b.syn.shape[0], device=dev) < p_sdrop) if p_sdrop > 0 else None
             with torch.autocast("cuda", dtype=torch.float16, enabled=dev == "cuda"):
-                out = model(b, syn)
+                out = model(b, syn, drop_syn=ds)
             out = {k: v.float() for k, v in out.items()}
             loss, parts = total_loss(out, b, beta=T["beta"], zero_inflated=zi)
             if lam_rank > 0:
@@ -119,7 +121,8 @@ def main():
                 loss = loss + lam_rank * lr_; parts["rank"] = lr_.item()
             if lam_aux > 0:
                 lg = out["aux"].split(sizes, dim=1)
-                la_ = sum(F.cross_entropy(lg[k], b.syn[:, k] - offs[k]) for k in range(3)) / 3
+                kp = slice(None) if ds is None else ~ds        # bo mau da xoa synthon khoi loss phu
+                la_ = sum(F.cross_entropy(lg[k][kp], b.syn[kp, k] - offs[k]) for k in range(3)) / 3
                 loss = loss + lam_aux * la_; parts["aux"] = la_.item()
             scaler.scale(loss / acc).backward()
             st["mb"] += 1; seen += bs; run[0] += parts["target"]; run[1] += parts["control"]; run[2] += 1

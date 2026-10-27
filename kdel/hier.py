@@ -110,7 +110,7 @@ class HierDEL(nn.Module):
         self.log_disp = nn.Parameter(torch.zeros(2))
         self.aux = nn.Linear(H, int(sum(aux_sizes))) if aux_sizes else None
 
-    def forward(self, d, syn_store):
+    def forward(self, d, syn_store, drop_syn=None):
         B = d.syn.shape[0]
         u, inv = torch.unique(d.syn, return_inverse=True)            # inv: [B,3]
         zs = self.syn_enc(*syn_store.batch(u), n=len(u))             # [U,H]
@@ -126,8 +126,12 @@ class HierDEL(nn.Module):
                            self.pair[1](torch.cat([zA, zC], -1)),
                            self.pair[2](torch.cat([zB, zC], -1)),
                            self.tri(zf)], dim=1)  + self.tok_type        # [B,7,H]
-        tok = self.tf(tok)
-        z, _ = self.attn(self.q.expand(B, -1, -1), tok, tok, need_weights=False)
+        kpm = None
+        if drop_syn is not None:              # che 6 token synthon -> chi con token ABC
+            kpm = torch.zeros(B, 7, dtype=torch.bool, device=tok.device)
+            kpm[:, :6] = drop_syn.view(-1, 1)
+        tok = self.tf(tok, src_key_padding_mask=kpm)
+        z, _ = self.attn(self.q.expand(B, -1, -1), tok, tok, need_weights=False, key_padding_mask=kpm)
         z = self.norm(z.squeeze(1))
         out = {"log_lambda": self.score(z), "pi_logit": self.zero(z),
                "log_disp": self.log_disp, "z": z}
