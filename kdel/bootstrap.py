@@ -2,7 +2,7 @@ import argparse, os
 import numpy as np, pandas as pd, torch
 from scipy.stats import rankdata
 from kdel.hier import HierDEL, LMTable
-from kdel.evaluate import load_heldout, score
+from kdel.evaluate import load_heldout, score, MolLMTable
 
 # Spearman tot nhat cua MO HINH ML trong bai KinDEL (split disynthon). None = bai bao khong bao cao o nay.
 BASELINE = {
@@ -32,14 +32,15 @@ def main():
     ap.add_argument("--ckpts", nargs="+", required=True)
     ap.add_argument("--device", default="cpu"); ap.add_argument("--B", type=int, default=5000)
     ap.add_argument("--out", default="bootstrap.csv"); ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--lm_dir", default=None)
+    ap.add_argument("--lm_dir", default=None); ap.add_argument("--mol_lm_dir", default=None)
     a = ap.parse_args()
-    models, lms = [], []
+    models, lms, mls = [], [], []
     for d in a.ckpts:
         cfg = torch.load(f"{d}/last.pt", map_location="cpu")["cfg"]
         m = HierDEL(**cfg["model"]).to(a.device)
         m.load_state_dict(torch.load(f"{d}/best.pt", map_location=a.device)); models.append(m)
         lms.append(LMTable(a.lm_dir, a.device) if cfg["model"].get("use_lm") else None)
+        mls.append(MolLMTable(a.mol_lm_dir, a.device) if cfg["model"].get("use_mol_lm") else None)
     rng = np.random.default_rng(a.seed); rows = []
     for cond in ("on", "off"):
         full = load_heldout(a.root, a.target, cond)
@@ -50,7 +51,8 @@ def main():
         for lib, dfj, dsyn in jobs:
             df = dfj.reset_index(drop=True); n = len(df); kd = df["kd"].to_numpy()
             if n < 5: continue
-            S = [score(m, df, a.device, lm=l, drop_syn=dsyn) for m, l in zip(models, lms)]
+            S = [score(m, df, a.device, lm=l, drop_syn=dsyn, mol_lm=g)
+                 for m, l, g in zip(models, lms, mls)]
             idx = rng.integers(0, n, size=(a.B, n))
             base = BASELINE[a.target].get((cond, lib))
             for rule in S[0]:

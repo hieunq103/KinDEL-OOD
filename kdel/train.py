@@ -50,7 +50,8 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--max_steps", type=int, default=0)   # >0: chay thu
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--lm_dir", default=None)   # thu muc co synthon_chemberta.npz (bat buoc neu model.use_lm)
+    ap.add_argument("--lm_dir", default=None)
+    ap.add_argument("--mol_lm_dir", default=None)   # thu muc co mol_emb_fp16.npy + stats.npz (PA4)   # thu muc co synthon_chemberta.npz (bat buoc neu model.use_lm)
     a = ap.parse_args()
 
     cfg = yaml.safe_load(open(a.config)); M, T = cfg["model"], cfg["train"]
@@ -58,7 +59,7 @@ def main():
     dev = a.device; t_start = time.time()
     torch.manual_seed(a.seed); np.random.seed(a.seed)
 
-    store = GPUGraphStore(a.root, dev)
+    store = GPUGraphStore(a.root, dev, mol_lm=a.mol_lm_dir if M.get("use_mol_lm") else None)
     voc = pd.read_parquet(f"{a.root}/synthon_vocab.parquet").sort_values("id")
     assert (voc["id"].to_numpy() == np.arange(len(voc))).all()
     lm = LMTable(a.lm_dir, dev) if M.get("use_lm") else None

@@ -11,7 +11,7 @@ class Batch:
     pass
 
 class GPUGraphStore:
-    def __init__(self, root, device="cuda"):
+    def __init__(self, root, device="cuda", mol_lm=None):
         L = lambda n: torch.from_numpy(np.load(f"{root}/{n}")).to(device)
         self.x    = L("graphs_x_fp16.npy")
         self.ei   = L("graphs_ei_int16.npy")
@@ -21,6 +21,12 @@ class GPUGraphStore:
         self.cnt  = L("counts_int32.npy").long()
         self.w    = L("conf_weight_fp16.npy")
         self.dev  = device
+        self.lm = None
+        if mol_lm:                                    # embedding LM muc phan tu (PA4)
+            st = np.load(f"{mol_lm}/stats.npz")
+            self.lm = torch.from_numpy(np.load(f"{mol_lm}/mol_emb_fp16.npy")).to(device)
+            self.lm_mean = torch.from_numpy(st["mean"]).to(device)
+            self.lm_std  = torch.from_numpy(st["std"]).to(device)
 
     def batch(self, idx):
         idx = idx.to(self.dev).long()
@@ -39,6 +45,8 @@ class GPUGraphStore:
         B.pre = c[:, 6].float() + 1.0
         B.weight = self.w[idx].float()
         B.idx = idx
+        if self.lm is not None:
+            B.lm_mol = (self.lm[idx].float() - self.lm_mean) / self.lm_std
         return B
 
 def epoch_batches(store, indices, bs, shuffle, seed=0):

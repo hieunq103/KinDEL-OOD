@@ -1,20 +1,21 @@
 import argparse, glob, os
 import numpy as np, pandas as pd, torch
 from kdel.hier import HierDEL, LMTable
-from kdel.evaluate import load_heldout, score
+from kdel.evaluate import load_heldout, score, MolLMTable
 from kdel.bootstrap import spearman_rows
 
 
-def load_set(pattern, dev, lm_dir):
+def load_set(pattern, dev, lm_dir, mol_lm_dir=None):
     dirs = sorted(d for d in glob.glob(pattern, recursive=True) if os.path.exists(f"{d}/best.pt"))
     assert dirs, f"khong tim thay checkpoint: {pattern}"
-    models, lms = [], []
+    models, lms, mls = [], [], []
     for d in dirs:
         cfg = torch.load(f"{d}/last.pt", map_location="cpu")["cfg"]
         m = HierDEL(**cfg["model"]).to(dev)
         m.load_state_dict(torch.load(f"{d}/best.pt", map_location=dev)); models.append(m)
         lms.append(LMTable(lm_dir, dev) if cfg["model"].get("use_lm") else None)
-    return models, lms, [os.path.basename(d) for d in dirs]
+        mls.append(MolLMTable(mol_lm_dir, dev) if cfg["model"].get("use_mol_lm") else None)
+    return models, lms, mls, [os.path.basename(d) for d in dirs]
 
 
 def main():
@@ -22,7 +23,7 @@ def main():
     ap.add_argument("--a_pat", required=True)
     ap.add_argument("--b_pat", required=True)
     ap.add_argument("--root_pat", required=True)
-    ap.add_argument("--lm_dir", default=None)
+    ap.add_argument("--lm_dir", default=None); ap.add_argument("--mol_lm_dir", default=None)
     ap.add_argument("--targets", nargs="+", default=["ddr1", "mapk14"])
     ap.add_argument("--rules", nargs="+", default=["logλ_target", "logλ_t−logλ_c"])
     ap.add_argument("--device", default="cpu"); ap.add_argument("--B", type=int, default=5000)
@@ -31,8 +32,8 @@ def main():
     rng = np.random.default_rng(a.seed); rows = []; pool = {}
     for t in a.targets:
         root = os.path.dirname(glob.glob(a.root_pat.format(t=t), recursive=True)[0])
-        MA, LA, NA = load_set(a.a_pat.format(t=t), a.device, a.lm_dir)
-        MB, LB, NB = load_set(a.b_pat.format(t=t), a.device, a.lm_dir)
+        MA, LA, GA, NA = load_set(a.a_pat.format(t=t), a.device, a.lm_dir, a.mol_lm_dir)
+        MB, LB, GB, NB = load_set(a.b_pat.format(t=t), a.device, a.lm_dir, a.mol_lm_dir)
         print(f"[{t}] A: {len(MA)} ckpt | B: {len(MB)} ckpt", flush=True)
         for cond in ("on", "off"):
             full = load_heldout(root, t, cond)
@@ -43,8 +44,8 @@ def main():
             for lib, dfj, dsyn in jobs:
                 df = dfj.reset_index(drop=True); n = len(df); kd = df["kd"].to_numpy()
                 if n < 5: continue
-                SA = [score(m, df, a.device, lm=l, drop_syn=dsyn) for m, l in zip(MA, LA)]
-                SB = [score(m, df, a.device, lm=l, drop_syn=dsyn) for m, l in zip(MB, LB)]
+                SA = [score(m, df, a.device, lm=l, drop_syn=dsyn, mol_lm=g) for m, l, g in zip(MA, LA, GA)]
+                SB = [score(m, df, a.device, lm=l, drop_syn=dsyn, mol_lm=g) for m, l, g in zip(MB, LB, GB)]
                 idx = rng.integers(0, n, size=(a.B, n))
                 for rule in a.rules:
                     bootA = np.mean([-spearman_rows(s[rule][idx], kd[idx]) for s in SA], axis=0)

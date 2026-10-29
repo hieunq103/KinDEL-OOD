@@ -1,5 +1,5 @@
 import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
-from torch_geometric.nn import GINEConv, global_add_pool
+from torch_geometric.nn import GINEConv, global_add_pool, global_mean_pool, global_max_pool
 from kdel.gpu_data import _ranges
 from kdel.featurize import smiles_to_arrays
 
@@ -63,8 +63,50 @@ class SynStore:
         return x, ei, ea, b
 
 
+def readout_graph(h, batch, n, proj=None):
+    """proj=None -> chi tong (nhu PA1-PA3); nguoc lai noi [sum || mean || max] roi chieu ve H."""
+    if proj is None:
+        return global_add_pool(h, batch, size=n)
+    return proj(torch.cat([global_add_pool(h, batch, size=n),
+                           global_mean_pool(h, batch, size=n),
+                           global_max_pool(h, batch, size=n)], -1))
+
+
+class DMPNNEncoder(nn.Module):
+    """Truyen tin theo CANH CO HUONG (kieu Chemprop). featurize luu moi lien ket thanh hai
+       canh nguoc nhau LIEN TIEP va moi phan tu co so canh chan, nen canh nguoc cua canh k
+       trong batch luon la k^1."""
+    def __init__(self, node_dim, edge_dim, hidden, n_layers, dropout, readout="sum"):
+        super().__init__()
+        self.W_i = nn.Linear(node_dim + edge_dim, hidden)
+        self.W_h = nn.Linear(hidden, hidden)
+        self.W_o = nn.Linear(node_dim + hidden, hidden)
+        self.bns = nn.ModuleList([nn.BatchNorm1d(hidden) for _ in range(n_layers)])
+        self.drop = nn.Dropout(dropout)
+        self.hidden = hidden
+        self.out = nn.Linear(3 * hidden, hidden) if readout == "smm" else None
+
+    def forward(self, x, ei, ea, batch, n):
+        src, dst = ei[0], ei[1]
+        m = src.numel()
+        if m == 0:
+            S = x.new_zeros(x.shape[0], self.hidden)
+            hv = F.relu(self.W_o(torch.cat([x.to(S.dtype), S], -1)))
+            return readout_graph(hv, batch, n, self.out)
+        h0 = F.relu(self.W_i(torch.cat([x[src], ea], -1)))        # [m,H] tin tren canh
+        h, rev = h0, torch.arange(m, device=x.device) ^ 1
+        for bn in self.bns:
+            S = torch.zeros(x.shape[0], self.hidden, device=x.device, dtype=h.dtype)
+            S = S.index_add_(0, dst, h)                           # S[a] = tong canh di VAO a
+            h = F.relu(h0 + self.drop(bn(self.W_h(S[src] - h[rev]))))   # tru canh nguoc
+        S = torch.zeros(x.shape[0], self.hidden, device=x.device, dtype=h.dtype)
+        S = S.index_add_(0, dst, h)
+        hv = F.relu(self.W_o(torch.cat([x.to(S.dtype), S], -1)))
+        return readout_graph(hv, batch, n, self.out)
+
+
 class GINEEncoder(nn.Module):
-    def __init__(self, node_dim, edge_dim, hidden, n_layers, dropout):
+    def __init__(self, node_dim, edge_dim, hidden, n_layers, dropout, readout="sum"):
         super().__init__()
         self.node_in = nn.Linear(node_dim, hidden)
         self.edge_in = nn.Linear(edge_dim, hidden)
@@ -72,12 +114,13 @@ class GINEEncoder(nn.Module):
                                     for _ in range(n_layers)])
         self.bns   = nn.ModuleList([nn.BatchNorm1d(hidden) for _ in range(n_layers)])
         self.drop  = nn.Dropout(dropout)
+        self.out   = nn.Linear(3 * hidden, hidden) if readout == "smm" else None
 
     def forward(self, x, ei, ea, batch, n):
         h = self.node_in(x); e = self.edge_in(ea)
         for conv, bn in zip(self.convs, self.bns):
             h = h + self.drop(F.relu(bn(conv(h, ei, e))))      # residual
-        return global_add_pool(h, batch, size=n)
+        return readout_graph(h, batch, n, self.out)
 
 
 class HierDEL(nn.Module):
@@ -87,12 +130,18 @@ class HierDEL(nn.Module):
        fusion: 'add' = khong cong ; 'gate' = tanh(alpha) * proj(emb)  (kieu MolProphecy, alpha la so vo huong hoc duoc).
        aux_sizes: (nA,nB,nC) -> them dau doan ID synthon tu vector tong hop z."""
     def __init__(self, node_dim=28, edge_dim=6, hidden=256, n_layers=5, syn_layers=3,
-                 dropout=0.2, heads=4, use_lm=False, lm_dim=384, fusion="add", aux_sizes=None):
+                 dropout=0.2, heads=4, use_lm=False, lm_dim=384, fusion="add", aux_sizes=None,
+                 mol_enc="gine", readout="sum", use_mol_lm=False, mol_lm_dim=384):
         super().__init__()
         H = hidden
         self.use_lm, self.fusion = use_lm, fusion
-        self.syn_enc  = GINEEncoder(node_dim, edge_dim, H, syn_layers, dropout)
-        self.full_enc = GINEEncoder(node_dim, edge_dim, H, n_layers, dropout)
+        self.use_mol_lm = use_mol_lm
+        self.syn_enc  = GINEEncoder(node_dim, edge_dim, H, syn_layers, dropout, readout)
+        self.full_enc = (DMPNNEncoder(node_dim, edge_dim, H, n_layers, dropout, readout)
+                         if mol_enc == "dmpnn" else
+                         GINEEncoder(node_dim, edge_dim, H, n_layers, dropout, readout))
+        if use_mol_lm:
+            self.mol_proj = nn.Sequential(nn.Dropout(dropout), nn.Linear(mol_lm_dim, H))
         if use_lm:
             self.lm_proj = nn.Sequential(nn.Dropout(dropout), nn.Linear(lm_dim, H))
             if fusion == "gate":
@@ -100,7 +149,8 @@ class HierDEL(nn.Module):
         self.pos  = nn.Embedding(3, H)
         self.pair = nn.ModuleList([mlp(2 * H, H, H) for _ in range(3)])   # AB, AC, BC
         self.tri  = nn.Linear(H, H)
-        self.tok_type = nn.Parameter(torch.randn(7, H) * 0.02)
+        self.n_tok = 8 if use_mol_lm else 7
+        self.tok_type = nn.Parameter(torch.randn(self.n_tok, H) * 0.02)
         self.tf   = nn.TransformerEncoderLayer(H, heads, 2 * H, dropout, batch_first=True, norm_first=True)
         self.q    = nn.Parameter(torch.randn(1, 1, H) * 0.02)
         self.attn = nn.MultiheadAttention(H, heads, dropout=dropout, batch_first=True)
@@ -121,14 +171,17 @@ class HierDEL(nn.Module):
             zs = zs + e
         zA, zB, zC = [zs[inv[:, k]] + self.pos.weight[k] for k in range(3)]
         zf = self.full_enc(d.x, d.edge_index, d.edge_attr, d.batch, n=B)
-        tok = torch.stack([zA, zB, zC,
-                           self.pair[0](torch.cat([zA, zB], -1)),
-                           self.pair[1](torch.cat([zA, zC], -1)),
-                           self.pair[2](torch.cat([zB, zC], -1)),
-                           self.tri(zf)], dim=1)  + self.tok_type        # [B,7,H]
+        toks = [zA, zB, zC,
+                self.pair[0](torch.cat([zA, zB], -1)),
+                self.pair[1](torch.cat([zA, zC], -1)),
+                self.pair[2](torch.cat([zB, zC], -1)),
+                self.tri(zf)]
+        if self.use_mol_lm:
+            toks.append(self.mol_proj(d.lm_mol))      # token 8: KHONG bi che boi synthon-dropout
+        tok = torch.stack(toks, dim=1) + self.tok_type        # [B,n_tok,H]
         kpm = None
         if drop_syn is not None:              # che 6 token synthon -> chi con token ABC
-            kpm = torch.zeros(B, 7, dtype=torch.bool, device=tok.device)
+            kpm = torch.zeros(B, self.n_tok, dtype=torch.bool, device=tok.device)
             kpm[:, :6] = drop_syn.view(-1, 1)
         tok = self.tf(tok, src_key_padding_mask=kpm)
         z, _ = self.attn(self.q.expand(B, -1, -1), tok, tok, need_weights=False, key_padding_mask=kpm)
