@@ -32,8 +32,9 @@ def main():
     rng = np.random.default_rng(a.seed); rows = []; pool = {}
     for t in a.targets:
         root = os.path.dirname(glob.glob(a.root_pat.format(t=t), recursive=True)[0])
-        MA, LA, GA, NA = load_set(a.a_pat.format(t=t), a.device, a.lm_dir, a.mol_lm_dir)
-        MB, LB, GB, NB = load_set(a.b_pat.format(t=t), a.device, a.lm_dir, a.mol_lm_dir)
+        mld = a.mol_lm_dir.format(t=t) if a.mol_lm_dir else None   # cho phep mau co {t}
+        MA, LA, GA, NA = load_set(a.a_pat.format(t=t), a.device, a.lm_dir, mld)
+        MB, LB, GB, NB = load_set(a.b_pat.format(t=t), a.device, a.lm_dir, mld)
         print(f"[{t}] A: {len(MA)} ckpt | B: {len(MB)} ckpt", flush=True)
         for cond in ("on", "off"):
             full = load_heldout(root, t, cond)
