@@ -131,7 +131,7 @@ class HierDEL(nn.Module):
        aux_sizes: (nA,nB,nC) -> them dau doan ID synthon tu vector tong hop z."""
     def __init__(self, node_dim=28, edge_dim=6, hidden=256, n_layers=5, syn_layers=3,
                  dropout=0.2, heads=4, use_lm=False, lm_dim=384, fusion="add", aux_sizes=None,
-                 mol_enc="gine", readout="sum", use_mol_lm=False, mol_lm_dim=384):
+                 mol_enc="gine", readout="sum", use_mol_lm=False, mol_lm_dim=384, residual=False):
         super().__init__()
         H = hidden
         self.use_lm, self.fusion = use_lm, fusion
@@ -156,6 +156,9 @@ class HierDEL(nn.Module):
         self.attn = nn.MultiheadAttention(H, heads, dropout=dropout, batch_first=True)
         self.norm = nn.LayerNorm(H)
         self.score = mlp(H, H, 2)       # log lambda: target, control
+        self.residual = residual        # PA5A: dau 0 = Delta (khoi tao 0), dau 1 = logL_c ; logL_t = logL_c + Delta
+        if residual:
+            nn.init.zeros_(self.score[-1].weight[0]); nn.init.zeros_(self.score[-1].bias[0])
         self.zero  = mlp(H, H, 2)       # logit pi (chi dung khi zero_inflated)
         self.log_disp = nn.Parameter(torch.zeros(2))
         self.aux = nn.Linear(H, int(sum(aux_sizes))) if aux_sizes else None
@@ -186,7 +189,9 @@ class HierDEL(nn.Module):
         tok = self.tf(tok, src_key_padding_mask=kpm)
         z, _ = self.attn(self.q.expand(B, -1, -1), tok, tok, need_weights=False, key_padding_mask=kpm)
         z = self.norm(z.squeeze(1))
-        out = {"log_lambda": self.score(z), "pi_logit": self.zero(z),
+        ll = self.score(z)
+        if self.residual: ll = torch.stack([ll[:, 1] + ll[:, 0], ll[:, 1]], -1)   # PA5A
+        out = {"log_lambda": ll, "pi_logit": self.zero(z),
                "log_disp": self.log_disp, "z": z}
         if self.aux is not None:
             out["aux"] = self.aux(z)

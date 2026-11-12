@@ -113,7 +113,7 @@ def main():
             with torch.autocast("cuda", dtype=torch.float16, enabled=dev == "cuda"):
                 out = model(b, syn, drop_syn=ds)
             out = {k: v.float() for k, v in out.items()}
-            loss, parts = total_loss(out, b, beta=T["beta"], zero_inflated=zi)
+            loss, parts = total_loss(out, b, beta=T["beta"], zero_inflated=zi, delta_l2=float(T.get("delta_l2", 0.0)))
             if lam_rank > 0:
                 S_ = b.target_counts.sum(1).float()
                 y_ = torch.log((b.target_counts.float().mean(1) + 0.5) / b.pre)

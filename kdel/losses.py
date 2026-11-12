@@ -13,14 +13,16 @@ def nb_nll(counts, log_lambda, log_disp, pre, pi_logit=None):
     lp_z  = torch.log(pi + (1-pi)*nb.log_prob(torch.zeros_like(counts).float()).exp() + 1e-12)
     return -torch.where(counts == 0, lp_z, lp_nz).mean(1)
 
-def total_loss(out, b, beta=1.0, zero_inflated=True):
+def total_loss(out, b, beta=1.0, zero_inflated=True, delta_l2=0.0):  # PA5A
     ll_t, ll_c = out["log_lambda"].unbind(-1)
     pi_t, pi_c = out["pi_logit"].unbind(-1)
     d_t,  d_c  = out["log_disp"].unbind(-1)
     if not zero_inflated: pi_t = pi_c = None
     l_t = nb_nll(b.target_counts,  ll_t, d_t, b.pre, pi_t).mean()
     l_c = nb_nll(b.control_counts, ll_c, d_c, b.pre, pi_c).mean()
-    return l_t + beta*l_c, {"target": l_t.item(), "control": l_c.item()}
+    loss = l_t + beta*l_c
+    if delta_l2 > 0: loss = loss + delta_l2 * (ll_t - ll_c).pow(2).mean()   # PA5A: phat L2 tren Delta
+    return loss, {"target": l_t.item(), "control": l_c.item()}
 
 
 def rank_loss(score, y, w, margin=0.5):

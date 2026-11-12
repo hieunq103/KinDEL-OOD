@@ -8,7 +8,7 @@ def sub(path, old, new, tag):
     p.write_text(s.replace(old, new, 1)); print(f"[ok] {path} ({tag})")
 
 # model
-sub("kdel/hier.py", "use_mol_lm=False, mol_lm_dim=384,", "use_mol_lm=False, mol_lm_dim=384, residual=False,", "residual=False,")
+sub("kdel/hier.py", "use_mol_lm=False, mol_lm_dim=384", "use_mol_lm=False, mol_lm_dim=384, residual=False", "residual=False")
 sub("kdel/hier.py", "        self.score = mlp(H, H, 2)       # log lambda: target, control\n",
     "        self.score = mlp(H, H, 2)       # log lambda: target, control\n"
     "        self.residual = residual        # PA5A: dau 0 = Delta (khoi tao 0), dau 1 = logL_c ; logL_t = logL_c + Delta\n"
