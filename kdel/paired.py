@@ -26,9 +26,12 @@ def main():
     ap.add_argument("--lm_dir", default=None); ap.add_argument("--mol_lm_dir", default=None)
     ap.add_argument("--targets", nargs="+", default=["ddr1", "mapk14"])
     ap.add_argument("--rules", nargs="+", default=["logλ_target", "logλ_t−logλ_c"])
+    ap.add_argument("--rule_pairs", nargs="+", default=None,
+                    help="moi muc 'thuocdo_A:thuocdo_B' (A=ben a_pat, B=ben b_pat); ghi de --rules")
     ap.add_argument("--device", default="cpu"); ap.add_argument("--B", type=int, default=5000)
     ap.add_argument("--seed", type=int, default=0); ap.add_argument("--out", default="paired.csv")
     a = ap.parse_args()
+    pairs = [tuple(x.split(":")) for x in a.rule_pairs] if a.rule_pairs else [(r, r) for r in a.rules]
     rng = np.random.default_rng(a.seed); rows = []; pool = {}
     for t in a.targets:
         root = os.path.dirname(glob.glob(a.root_pat.format(t=t), recursive=True)[0])
@@ -48,12 +51,13 @@ def main():
                 SA = [score(m, df, a.device, lm=l, drop_syn=dsyn, mol_lm=g) for m, l, g in zip(MA, LA, GA)]
                 SB = [score(m, df, a.device, lm=l, drop_syn=dsyn, mol_lm=g) for m, l, g in zip(MB, LB, GB)]
                 idx = rng.integers(0, n, size=(a.B, n))
-                for rule in a.rules:
-                    bootA = np.mean([-spearman_rows(s[rule][idx], kd[idx]) for s in SA], axis=0)
-                    bootB = np.mean([-spearman_rows(s[rule][idx], kd[idx]) for s in SB], axis=0)
+                for ra, rb in pairs:
+                    rule = ra if ra == rb else f"{ra} | {rb}"
+                    bootA = np.mean([-spearman_rows(s[ra][idx], kd[idx]) for s in SA], axis=0)
+                    bootB = np.mean([-spearman_rows(s[rb][idx], kd[idx]) for s in SB], axis=0)
                     d = bootB - bootA
-                    pa = float(np.mean([-spearman_rows(s[rule][None], kd[None])[0] for s in SA]))
-                    pb = float(np.mean([-spearman_rows(s[rule][None], kd[None])[0] for s in SB]))
+                    pa = float(np.mean([-spearman_rows(s[ra][None], kd[None])[0] for s in SA]))
+                    pb = float(np.mean([-spearman_rows(s[rb][None], kd[None])[0] for s in SB]))
                     lo, hi = np.percentile(d, [2.5, 97.5])
                     rows.append(dict(target=t, cond=cond, lib=lib, n=n, rule=rule, A=pa, B=pb,
                                      diff=pb - pa, ci_lo=lo, ci_hi=hi,
