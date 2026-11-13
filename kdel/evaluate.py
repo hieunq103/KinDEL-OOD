@@ -52,7 +52,7 @@ def score(model, df, dev, bs=64, lm=None, drop_syn=False, mol_lm=None):
         mp = {s: i for i, s in enumerate(uniq)}
         ids = np.stack([df[c].map(mp).to_numpy() for c in cols], 1)
         syn = SynStore(uniq, dev, lm=lm)
-    smi = df["smiles"].tolist(); s_t, s_d = [], []
+    smi = df["smiles"].tolist(); s_t, s_d, s_s = [], [], []
     ME = mol_lm.lookup(smi) if mol_lm is not None else None
     model.eval()
     for i in range(0, len(df), bs):
@@ -62,7 +62,10 @@ def score(model, df, dev, bs=64, lm=None, drop_syn=False, mol_lm=None):
         o = model(b, syn, drop_syn=dsm)
         lt, lc = o["log_lambda"].float().unbind(-1)
         s_t.append(lt.cpu()); s_d.append((lt - lc).cpu())
-    return {"logλ_target": torch.cat(s_t).numpy(), "logλ_t−logλ_c": torch.cat(s_d).numpy()}
+        if "log_spec" in o: s_s.append(o["log_spec"].float().cpu())      # PA5B
+    out = {"logλ_target": torch.cat(s_t).numpy(), "logλ_t−logλ_c": torch.cat(s_d).numpy()}
+    if s_s: out["logλ_spec"] = torch.cat(s_s).numpy()
+    return out
 
 
 def load_heldout(root, target, cond):

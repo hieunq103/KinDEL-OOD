@@ -131,7 +131,7 @@ class HierDEL(nn.Module):
        aux_sizes: (nA,nB,nC) -> them dau doan ID synthon tu vector tong hop z."""
     def __init__(self, node_dim=28, edge_dim=6, hidden=256, n_layers=5, syn_layers=3,
                  dropout=0.2, heads=4, use_lm=False, lm_dim=384, fusion="add", aux_sizes=None,
-                 mol_enc="gine", readout="sum", use_mol_lm=False, mol_lm_dim=384, residual=False):
+                 mol_enc="gine", readout="sum", use_mol_lm=False, mol_lm_dim=384, residual=False, additive=False):
         super().__init__()
         H = hidden
         self.use_lm, self.fusion = use_lm, fusion
@@ -156,6 +156,8 @@ class HierDEL(nn.Module):
         self.attn = nn.MultiheadAttention(H, heads, dropout=dropout, batch_first=True)
         self.norm = nn.LayerNorm(H)
         self.score = mlp(H, H, 2)       # log lambda: target, control
+        self.additive = additive      # PA5B: lambda_t = lambda_matrix + lambda_spec
+        assert not (residual and additive), 'residual va additive loai tru nhau'
         self.residual = residual        # PA5A: dau 0 = Delta (khoi tao 0), dau 1 = logL_c ; logL_t = logL_c + Delta
         if residual:
             nn.init.zeros_(self.score[-1].weight[0]); nn.init.zeros_(self.score[-1].bias[0])
@@ -191,8 +193,13 @@ class HierDEL(nn.Module):
         z = self.norm(z.squeeze(1))
         ll = self.score(z)
         if self.residual: ll = torch.stack([ll[:, 1] + ll[:, 0], ll[:, 1]], -1)   # PA5A
+        sp = None
+        if self.additive:                                   # PA5B
+            sp, mx = ll[:, 0], ll[:, 1]                      # log lambda_spec, log lambda_matrix
+            ll = torch.stack([torch.logaddexp(mx, sp), mx], -1)
         out = {"log_lambda": ll, "pi_logit": self.zero(z),
                "log_disp": self.log_disp, "z": z}
+        if sp is not None: out["log_spec"] = sp              # PA5B: diem xep hang
         if self.aux is not None:
             out["aux"] = self.aux(z)
         return out
